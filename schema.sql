@@ -117,7 +117,10 @@ CREATE TABLE users (
     id INT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(80) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
-    role ENUM('admin', 'staff') NOT NULL DEFAULT 'staff'
+    role ENUM('admin', 'staff') NOT NULL DEFAULT 'staff',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_login_at DATETIME NULL
 );
 
 INSERT INTO categories (name, description)

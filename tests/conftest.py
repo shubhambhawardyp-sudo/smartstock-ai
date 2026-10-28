@@ -13,7 +13,15 @@ def app():
     with app.app_context():db.session.remove();db.drop_all()
 
 @pytest.fixture
-def client(app):return app.test_client()
+def client(app):
+    from werkzeug.security import generate_password_hash
+    from models.database_models import User
+    with app.app_context():
+        user=User(username="test-user",password_hash=generate_password_hash("test-password-long-enough"),role="admin")
+        db.session.add(user);db.session.commit()
+    client=app.test_client()
+    client.post("/login",data={"username":"test-user","password":"test-password-long-enough"})
+    return client
 
 @pytest.fixture
 def sample_ids(app):

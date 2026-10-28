@@ -1,6 +1,6 @@
 # SmartStock AI — Software Requirements Specification
 
-**Version:** 1.0  
+**Version:** 1.1
 **Status:** Student project specification  
 **System type:** Local web application with MySQL persistence and a batch demand-forecasting component
 
@@ -8,7 +8,7 @@
 
 SmartStock AI is a prototype for a small store that needs to maintain a product catalog, record stock changes and sales, review inventory health, and explore short-term product demand estimates. This document records the current implementation and its intended behavior so that the system can be reviewed, demonstrated, and extended.
 
-The current release is a single-user local demonstration. It does not implement sign-in, authorization, purchase-order processing, supplier communications, or production deployment controls. The `users` table is present for future development but is not currently used by the web application.
+The current release is a local store-management application with username/password sign-in. Accounts are created by a trusted operator through `create_user.py`; there is no public self-registration page. Each authenticated account currently has the same application permissions. Purchase-order processing, supplier communications, account recovery, and production deployment controls are outside the current scope.
 
 ### 1.1 Goals
 
@@ -22,15 +22,16 @@ The current release is a single-user local demonstration. It does not implement 
 
 | Role | Current interaction |
 |---|---|
-| Store administrator / demonstrator | Uses the dashboard and API to manage catalog, stock, sales, and forecasts. There is no login screen; the role is conceptual only. |
-| Developer / maintainer | Configures the local MySQL connection, runs schema/ETL/model commands, and maintains the Flask code. |
+| Store operator / account holder | Signs in to manage catalog, stock, sales, dashboard analytics, and forecasts. |
+| System maintainer | Creates accounts, configures the local MySQL connection, runs schema/migration/ETL/model commands, and maintains the Flask code. |
 
 ## 2. Technology stack
 
 | Layer | Technology | Responsibility |
 |---|---|---|
 | User interface | HTML, CSS, JavaScript, Bootstrap 5, Chart.js | Dashboard, product forms, charts, fetch calls to JSON API. Bootstrap and Chart.js are currently loaded from a CDN. |
-| Web server / API | Python 3.11+, Flask 3.x | Serves the dashboard and API endpoints; registers products, sales, analytics, and prediction blueprints. |
+| Web server / API | Python 3.11+, Flask 3.x, Flask-Login, Flask-WTF | Serves the sign-in page, authenticated dashboard and API endpoints; protects browser writes with CSRF tokens. |
+| Password security | Werkzeug password hashing | Stores and verifies password hashes; plaintext passwords are not stored. |
 | ORM / database access | Flask-SQLAlchemy 3.x, SQLAlchemy 2.x, PyMySQL | Maps Python models to relational tables and sends SQL to MySQL through the PyMySQL DB-API driver. |
 | Database | MySQL Server 8.0, InnoDB, `utf8mb4` | Stores catalog, stock, sales, movement history, daily summaries, predictions, ETL logs and model metrics. |
 | Configuration | `python-dotenv` and process environment | Loads local `.env` settings at application startup. |
@@ -48,7 +49,8 @@ Browser
   | HTTP (dashboard assets and JSON requests)
   v
 Flask app.py
-  | route blueprints: routes/products.py, sales.py, analytics.py, predictions.py
+  | route blueprints: auth.py, products.py, sales.py, analytics.py, predictions.py
+  | Flask-Login session + Flask-WTF CSRF protection
   v
 Services and SQLAlchemy models
   | Flask-SQLAlchemy / SQLAlchemy engine
@@ -86,12 +88,12 @@ SECRET_KEY=replace-with-a-long-random-value
 ### 3.3 Database initialization sequence
 
 1. Install/start MySQL Server and connect to the intended server/port.
-2. Execute `schema.sql` once in MySQL Workbench or with the MySQL CLI. It creates the database, tables and sample rows.
-3. Copy `.env.example` to `.env`; set `DATABASE_URL` for that server and schema.
-4. Install Python requirements and run `python app.py`.
-5. Check `http://127.0.0.1:5000/health/db` for `database: connected`.
+2. Execute the current `schema.sql` once in MySQL Workbench or with the MySQL CLI. It creates the database, current tables and sample rows. For an older database, `create_user.py` adds the login fields automatically if the MySQL account has `ALTER TABLE` permission; otherwise execute `migrations/002_user_auth.sql` once in Workbench.
+3. Copy `.env.example` to `.env`; set `DATABASE_URL` for that server/schema and a persistent random `SECRET_KEY` for browser sessions.
+4. Install Python requirements. Run `python create_user.py`; it checks the database connection and user-table schema, then prompts for the first username/password. Passwords must be at least 12 characters and are stored as hashes.
+5. Run `python app.py`, open `http://127.0.0.1:5000/login`, and sign in. Check `http://127.0.0.1:5000/health/db` for `database: connected`; this safe health endpoint does not require sign-in.
 
-The app's `db.create_all()` attempts to create absent tables after connecting, but it cannot create `smartstock_db` if the schema/database does not exist. It also does not populate seed categories or products. Use `schema.sql` for the initial database and sample content. Avoid re-running the seed script over a database that already contains those unique sample values.
+The app's `db.create_all()` attempts to create absent tables after connecting, but it cannot create `smartstock_db`, migrate existing tables, or populate seed categories/products. Use `schema.sql` for an initial database and sample content; use the one-time migration for existing databases. Avoid re-running the seed script over a database that already contains those unique sample values.
 
 ## 4. Functional requirements
 
@@ -101,7 +103,7 @@ The app's `db.create_all()` attempts to create absent tables after connecting, b
 | FR-02 | Maintain product catalog | API supports product listing/search, create, detail, update, and delete; category and supplier foreign keys must be valid. |
 | FR-03 | Prevent negative stock/price values | Product validation and MySQL check constraints reject invalid negative values. |
 | FR-04 | Record stock adjustment | A signed nonzero quantity and reason update the product balance and append a stock movement in the same operation. |
-| FR-05 | Record a sale | Sale processing validates product and positive quantity, checks available stock, creates invoice and line items, decreases stock, adds sale movement rows, and commits atomically; any error rolls back. |
+| FR-05 | Record a dated sale | Sales screen records product, positive quantity, and sale date. A sale dated today checks and decreases stock and adds a stock movement; a past-date entry adds invoice, line-item, and daily demand history without changing today's stock. All sale and daily-summary writes are atomic. Future sale dates and invalid quantities are rejected. |
 | FR-06 | Review stock movement | API returns latest movement history, including product, type, quantity, reason and timestamp. |
 | FR-07 | Review stock risk/reorder | API/dashboard use forecast daily demand, supplier lead time, safety stock and current stock to calculate risk and suggested reorder quantity. |
 | FR-08 | Import daily sales summaries | CSV import validates/maps SKU/date/units/revenue, aggregates repeated SKU/date rows, and inserts daily summaries idempotently while rejecting conflicting existing values. |
@@ -109,16 +111,18 @@ The app's `db.create_all()` attempts to create absent tables after connecting, b
 | FR-10 | Generate future estimates | Prediction API uses the saved model to produce seven daily estimates per product and persists them with a model version. |
 | FR-11 | Check DB health | `/health/db` performs a simple database query and returns connection state with a safe diagnostic hint. |
 | FR-12 | Record ETL run state | Pipeline records start/finish, status, processed record count, and error message in `pipeline_logs`. |
+| FR-13 | Sign in and sign out | A user with an active account can sign in using username/password and sign out. The application stores a password hash, records account creation/last sign-in, and protects dashboard/API routes behind an authenticated session. Public self-registration is not provided. |
+| FR-14 | Protect browser writes | Login, logout and state-changing API requests require a valid CSRF token. Session cookies are HTTP-only and use `SameSite=Lax`. |
 
 ## 5. Non-functional requirements
 
 - **NFR-01 Reliability:** Sales stock and invoice changes must be transactional. Invalid input must return an API error without partial stock updates.
 - **NFR-02 Data integrity:** Primary keys, foreign keys, unique indexes/constraints and check constraints must enforce core relationships and values in MySQL.
-- **NFR-03 Configuration safety:** Credentials and secret key are loaded from environment settings; local `.env` is not versioned.
+- **NFR-03 Configuration safety:** Database credentials and session secret are loaded from environment settings; local `.env` is not versioned. Missing/example session secrets are replaced by a temporary random key for local development; operators should set a persistent random key.
 - **NFR-04 Operability:** A developer can run the app locally and diagnose database availability using `/health/db` and the application terminal.
 - **NFR-05 Maintainability:** HTTP endpoints, domain services, ORM models, ETL stages, ML workflows, and UI assets are separated into named modules.
 - **NFR-06 Forecast transparency:** Forecast evaluation must use time-ordered holdout data; generated synthetic data must be identified as synthetic and its metrics must not be claimed as real-world performance.
-- **NFR-07 Scope/security:** The current build is for localhost only. Before network/production use it needs authentication, authorization, CSRF defenses, secret management, migration/backup strategy, and a production server.
+- **NFR-07 Scope/security:** The current build is for localhost use. It has sign-in and CSRF protection but does not enforce distinct user roles or provide password recovery. Before production use it needs HTTPS and secure cookies, role-based authorization, account recovery, a migration/backup strategy, and a production server.
 
 ## 6. Database schema
 
@@ -224,10 +228,13 @@ erDiagram
         varchar username UK
         varchar password_hash
         enum role
+        boolean is_active
+        datetime created_at
+        datetime last_login_at
     }
 ```
 
-`PIPELINE_LOGS`, `MODEL_METRICS`, and `USERS` have no foreign-key relationship in the current implementation. `USERS` is not wired to authentication. The `SALE_ITEMS` relationship to `SALES` is mandatory in practice: each sale item references exactly one sale; each sale created by the application contains one or more items.
+`PIPELINE_LOGS`, `MODEL_METRICS`, and `USERS` have no foreign-key relationship in the current implementation. `USERS` stores account identity, password hash, active state, role label and login timestamps. The role column is not currently used to distinguish permissions. The `SALE_ITEMS` relationship to `SALES` is mandatory in practice: each sale item references exactly one sale; each sale created by the application contains one or more items.
 
 ### 6.2 Table responsibilities and important constraints
 
@@ -243,11 +250,11 @@ erDiagram
 | `demand_predictions` | Forecast by product, forecast day and model. | Unique `(product_id, forecast_date, model_version)`; product deletion cascades to predictions. |
 | `pipeline_logs` | ETL run status, count, and error details. | No product relationship. |
 | `model_metrics` | Evaluation metric values by model/run label. | No product relationship. |
-| `users` | Reserved identity/role schema. | Unique username and password hash column; not currently used for application login. |
+| `users` | Sign-in identity and account state. | Unique username; password hash only; active flag; account creation and last login timestamps. Role values are stored but do not currently grant different permissions. |
 
 ### 6.3 Database behavior and data lifecycle
 
-- A completed sale decrements `products.stock_quantity`, inserts a `sales` row, one or more `sale_items`, and a `SALE` movement per sold product. These operations are committed together.
+- A sale dated today decrements `products.stock_quantity`, inserts a `sales` row, one or more `sale_items`, and a `SALE` movement per sold product. Past-date sales entered to backfill history create invoice and line-item records and update `daily_product_sales` without changing current stock. Sale rows, daily summaries, stock and movement records are committed together.
 - A manual adjustment changes the balance and inserts an `ADJUSTMENT` movement with a reason.
 - The CSV importer loads product-day totals to `daily_product_sales`; daily summaries are the main history input to model training and forecasts.
 - Forecast rows are generated per product/date and identify the model version. Regenerating the same model's current seven-day horizon replaces those horizon rows before committing fresh results.
@@ -255,11 +262,15 @@ erDiagram
 
 ## 7. API interface summary
 
-The API uses JSON and is served under `/api`, except for the root page and `/health/db`.
+The JSON API is served under `/api`. The dashboard and API require a signed-in session. State-changing browser requests include the CSRF token supplied by the dashboard page; `/health/db` is a safe unauthenticated connectivity check.
 
 | Method | Endpoint | Request/response intent |
 |---|---|---|
+| `GET`, `POST` | `/login` | Render sign-in page or authenticate username/password. |
+| `POST` | `/logout` | End the signed-in session; requires a CSRF token. |
 | `GET` | `/health/db` | Database connectivity status. |
+| `GET`, `POST` | `/login` | Render sign-in page or authenticate an active username/password account. |
+| `POST` | `/logout` | Sign out and clear the authenticated session. Requires a CSRF token. |
 | `GET` | `/api/products?q=<term>&page=<n>` | Product search and paginated list. |
 | `POST` | `/api/products` | Create product from SKU/name/category and optional price/stock fields. |
 | `GET`, `PUT`, `DELETE` | `/api/products/<id>` | Read, update or delete a product. |
@@ -267,12 +278,14 @@ The API uses JSON and is served under `/api`, except for the root page and `/hea
 | `GET`, `POST` | `/api/suppliers` | List or add a supplier. |
 | `POST` | `/api/products/<id>/adjust` | Apply signed quantity with a reason. |
 | `GET` | `/api/movements` | Latest stock movements. |
-| `POST` | `/api/sales` | Create sale from `{"items":[{"product_id":1,"quantity":2}]}`. |
-| `GET` | `/api/sales` | List recent invoices. |
+| `POST` | `/api/sales` | Record a sale from `{"sale_date":"2026-10-27","items":[{"product_id":1,"quantity":2}]}`. `sale_date` defaults to today; past dates backfill demand history without changing current stock. |
+| `GET` | `/api/sales` | List recent invoices and their product, SKU, quantity, price and date. |
 | `GET` | `/api/dashboard?days=30` | Dashboard cards, chart series and alerts. |
 | `GET` | `/api/reorder` | Risk and suggested reorder recommendations. |
 | `GET`, `POST` | `/api/predictions`, `/api/predictions/generate` | List saved forecasts or generate next seven days. |
 | `GET` | `/api/pipeline/status` | Latest ETL status. |
+
+Create accounts from the project folder with `python create_user.py`. This command asks for a username and password in the terminal and stores a password hash; accounts are not created through a public registration page.
 
 ## 8. Project structure
 
@@ -282,6 +295,9 @@ smartstock-ai/
 ├── config.py                      # Environment-backed settings and SQLAlchemy options
 ├── requirements.txt               # Python dependencies
 ├── schema.sql                     # MySQL database, table, and demo seed script
+├── create_user.py                 # Securely create a local account with a password hash
+├── migrations/
+│   └── 002_user_auth.sql           # Add auth fields to an existing database
 ├── seed_data.sql                  # Additional seed SQL (inspect before re-running)
 ├── sample_sales.csv               # Small source CSV used by the ETL pipeline
 ├── data/
@@ -290,6 +306,7 @@ smartstock-ai/
 │   ├── database_models.py          # SQLAlchemy relational models
 │   └── demand_model.py             # Forecast feature/model helpers
 ├── routes/
+│   ├── auth.py                     # Sign-in and sign-out routes
 │   ├── products.py                 # Product/category/supplier/stock APIs
 │   ├── sales.py                    # Sales APIs
 │   ├── analytics.py                # Dashboard analytics API
@@ -308,7 +325,9 @@ smartstock-ai/
 │   ├── evaluate.py                 # Evaluation helpers/entry point
 │   ├── generate_demo_data.py       # Explicit synthetic-data generator
 │   └── artifacts/                  # Saved joblib model artifact
-├── templates/index.html            # Dashboard HTML
+├── templates/
+│   ├── index.html                  # Authenticated dashboard
+│   └── login.html                  # Sign-in page
 ├── static/                         # Browser JavaScript and CSS
 ├── tests/                          # pytest tests (use a separate test database)
 ├── docs/
@@ -327,11 +346,11 @@ The local `.env`, Python virtual environment, and cache files are not part of th
 - The product's current stock is stored as a balance and changed through application operations; the movement table provides the audit trail.
 - A forecast is only an estimate. Short, synthetic, or sparse histories can produce weak results.
 - Generated sample sales are synthetic and should only be used to demonstrate pipeline behavior.
-- Authentication, multiple user roles, supplier purchase workflows, and production operations are not implemented.
+- Role-based permission differences, password recovery, supplier purchase workflows, and production operations are not implemented.
 
 ### Potential extensions
 
-- Authentication, authorization, audit identity, CSRF protection, and secure session policy.
+- Role-based authorization, password recovery, audit identity, stronger session policy for hosted deployments, and secure password reset.
 - Database migrations/versioning, automated backup/restore, and integration/deployment configuration.
 - Purchase orders and receiving workflows linked to suppliers and stock movements.
 - Promotion, holiday, price-change and stockout features in forecasting; forecast intervals and model monitoring.

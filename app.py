@@ -1,7 +1,9 @@
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask_login import LoginManager, current_user
+from flask_wtf.csrf import CSRFError, CSRFProtect
 from sqlalchemy import text
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -13,6 +15,7 @@ from routes.products import bp as products_bp
 from routes.sales import bp as sales_bp
 from routes.analytics import bp as analytics_bp
 from routes.predictions import bp as predictions_bp
+from routes.auth import bp as auth_bp
 
 
 def create_app(test_config=None):
@@ -20,7 +23,30 @@ def create_app(test_config=None):
     app.config.from_object(Config)
     if test_config: app.config.update(test_config)
     db.init_app(app)
+    login_manager = LoginManager()
+    login_manager.init_app(app)
+    login_manager.session_protection = "strong"
+
+    @login_manager.user_loader
+    def load_user(user_id):
+        from models.database_models import User
+        try:
+            return db.session.get(User, int(user_id))
+        except (TypeError, ValueError):
+            return None
+
+    CSRFProtect(app)
+    app.register_blueprint(auth_bp)
     app.register_blueprint(products_bp);app.register_blueprint(sales_bp);app.register_blueprint(analytics_bp);app.register_blueprint(predictions_bp)
+
+    @app.before_request
+    def require_sign_in():
+        if request.endpoint in {"auth.login", "static"} or request.path == "/health/db":
+            return None
+        if not current_user.is_authenticated:
+            if request.path.startswith("/api/"):
+                return jsonify({"ok":False,"error":"Please sign in to continue."}),401
+            return redirect(url_for("auth.login"))
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
     @app.get("/")
     def index(): return render_template("index.html")
@@ -47,6 +73,11 @@ def create_app(test_config=None):
         return jsonify({"ok":True,"last_run":None if not last else {"status":last.status,"started_at":last.started_at.isoformat(),"finished_at":last.finished_at.isoformat() if last.finished_at else None,"records_processed":last.records_processed,"error":last.error_message}})
     @app.errorhandler(404)
     def not_found(_):return jsonify({"ok":False,"error":"Resource not found"}),404
+    @app.errorhandler(CSRFError)
+    def csrf_error(_):
+        if request.path.startswith("/api/"):
+            return jsonify({"ok":False,"error":"Your session token expired. Refresh the page and try again."}),400
+        return render_template("login.html", error="Your session expired. Refresh the page and sign in again."),400
     @app.errorhandler(500)
     def server_error(_):db.session.rollback();return jsonify({"ok":False,"error":"Unexpected server error. Check application logs."}),500
     return app

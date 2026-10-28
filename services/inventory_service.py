@@ -1,7 +1,8 @@
+from datetime import date, datetime, time
 from decimal import Decimal
 import re
 from sqlalchemy.exc import IntegrityError
-from models.database_models import db, Product, StockMovement, Sale, SaleItem
+from models.database_models import db, Product, StockMovement, Sale, SaleItem, DailyProductSale
 
 
 def normalized_sku(sku):
@@ -35,12 +36,22 @@ def validate_product(payload, existing=None):
     return {"sku": str(payload["sku"]).strip().upper(), "name": str(payload["name"]).strip(), "description": payload.get("description", ""), "category_id": category, "supplier_id": payload.get("supplier_id") or None, "cost_price": cost, "selling_price": price, "stock_quantity": stock, "reorder_threshold": threshold, "lead_time_days": lead}
 
 
-def create_sale(items):
-    """Create invoice and stock movements atomically; raises ValueError on bad stock."""
+def create_sale(items, sale_date=None):
+    """Record a sale for a date; only today's sale changes current inventory."""
     if not isinstance(items, list) or not items:
         raise ValueError("At least one sale item is required")
     try:
-        sale = Sale(invoice_number="PENDING")
+        if sale_date in (None, ""):
+            sold_on = date.today()
+        elif isinstance(sale_date, date):
+            sold_on = sale_date
+        else:
+            sold_on = date.fromisoformat(str(sale_date))
+        if sold_on > date.today():
+            raise ValueError("Sale date cannot be in the future")
+
+        is_current_sale = sold_on == date.today()
+        sale = Sale(invoice_number="PENDING", sold_at=datetime.combine(sold_on, time.min))
         db.session.add(sale)
         db.session.flush()
         sale.invoice_number = f"SS-{sale.id:06d}"
@@ -50,13 +61,20 @@ def create_sale(items):
             qty = int(item["quantity"])
             if product is None or qty <= 0:
                 raise ValueError("Each sale needs a valid product and positive quantity")
-            if product.stock_quantity < qty:
+            if is_current_sale and product.stock_quantity < qty:
                 raise ValueError(f"Insufficient stock for {product.name}; available {product.stock_quantity}")
             line = Decimal(product.selling_price) * qty
-            product.stock_quantity -= qty
+            if is_current_sale:
+                product.stock_quantity -= qty
+                db.session.add(StockMovement(product=product, movement_type="SALE", quantity=-qty, reason="Completed sale", reference=sale.invoice_number))
             total += line
             db.session.add(SaleItem(sale=sale, product=product, quantity=qty, unit_price=product.selling_price, line_total=line))
-            db.session.add(StockMovement(product=product, movement_type="SALE", quantity=-qty, reason="Completed sale", reference=sale.invoice_number))
+            daily = DailyProductSale.query.filter_by(product_id=product.id, sale_date=sold_on).one_or_none()
+            if daily is None:
+                daily = DailyProductSale(product_id=product.id, sale_date=sold_on, units_sold=0, revenue=Decimal("0.00"))
+                db.session.add(daily)
+            daily.units_sold += qty
+            daily.revenue = Decimal(daily.revenue) + line
         sale.total_amount = total
         db.session.commit()
         return sale

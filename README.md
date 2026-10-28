@@ -1,6 +1,6 @@
 # SmartStock AI
 
-SmartStock AI is a Flask inventory management demonstration backed by MySQL. It supports a product catalog, stock adjustments, sales, inventory analytics, a CSV-to-database ETL pipeline, and a seven-day demand forecast. The project is intended for local learning and demonstration; it is not a production-ready, multi-user system.
+SmartStock AI is a Flask inventory management application backed by MySQL. It provides sign-in, a product catalog, stock adjustments, dated sales, inventory analytics, a CSV-to-database ETL pipeline, and a seven-day demand forecast. Accounts are created locally with a command-line setup tool; there is no public registration form.
 
 For the formal requirements, technology stack, full project structure, and database diagram, see [`docs/SRS.md`](docs/SRS.md).
 
@@ -27,8 +27,10 @@ The database server must be installed and running separately from this Python ap
 | `models/database_models.py` | SQLAlchemy definitions for the same operational and analytics tables used by the Flask code. |
 | `.env` | Local-only connection settings and Flask secret. This file is ignored by Git and must contain your actual local credentials. |
 | `.env.example` | Safe template showing the required settings; its values are placeholders and will not authenticate. |
-| `app.py` | Loads `.env`, configures SQLAlchemy and registers API routes. Running `python app.py` also calls `db.create_all()`; it can create missing tables only after the named database already exists, and it does not insert the demo seed rows. |
-| `config.py` | Reads `DATABASE_URL`, `SECRET_KEY`, and optional `MODEL_PATH`; configures SQLAlchemy connection-pool checks. |
+| `app.py` | Loads `.env`, configures SQLAlchemy, sign-in, CSRF protection and API routes. Running `python app.py` also calls `db.create_all()`; it cannot migrate existing tables or insert demo seed rows. |
+| `config.py` | Reads `DATABASE_URL`, `SECRET_KEY`, and optional `MODEL_PATH`; configures database-pool and session-cookie settings. |
+| `create_user.py` | Creates an account with a Werkzeug password hash; password input is hidden and never stored as plain text. |
+| `migrations/002_user_auth.sql` | Adds account status and login timestamp fields to a database created with the older schema. |
 
 ### Windows setup
 
@@ -67,17 +69,37 @@ Replace `YOUR_PASSWORD`; do not include the angle brackets. The username is the 
 
 If a password contains URL-reserved characters such as `@`, `:`, `/`, `#`, or `%`, URL-encode those characters in the URL. For example, encode `@` as `%40`. Do not put quotes around the complete `DATABASE_URL` line. A simple password is easier for a local beginner setup.
 
-#### 4. Install Python dependencies and run
+#### 4. Install Python dependencies and update an existing database
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+If you already created the database using an earlier version of `schema.sql`, `python create_user.py` checks for the new login columns and adds them before creating the account. The MySQL account in `DATABASE_URL` needs permission to alter the `users` table. If it does not have that permission, open `migrations/002_user_auth.sql` in Workbench and run it once. A new database created from the updated `schema.sql` already has these columns.
+
+#### 5. Set a persistent Flask secret
+
+Generate a random secret in the activated project environment:
+
+```powershell
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Copy the output into `.env` as the `SECRET_KEY` value, without quotes. If the setting is absent or still has the example `replace-...` value, the app creates a temporary random key for this run; sessions will be invalidated after restart.
+
+#### 6. Create an account and start the app
+
+Run the account setup command from the project folder. It checks the database connection and login schema first, then asks for a username and a password of at least 12 characters. Password input is hidden and only the password hash is saved:
+
+```powershell
+python create_user.py
 python app.py
 ```
 
-Open <http://127.0.0.1:5000>. The first app start runs SQLAlchemy `create_all()` to create any missing tables inside the configured database. Running `schema.sql` first is recommended because it also creates the named database and seeds its example records.
+Open <http://127.0.0.1:5000/login> and sign in. The first app start runs SQLAlchemy `create_all()` to create missing tables inside the configured database. It does not migrate existing tables, create the named database, or insert demo seed rows. Use the migration above for a database created before login support.
 
 ### Verify and troubleshoot the connection
 
@@ -89,15 +111,17 @@ Open <http://127.0.0.1:5000/health/db>. A successful connection returns JSON con
 | Access denied | Check the MySQL username and password; these are not necessarily the same as your Windows login or Workbench connection name. |
 | Unknown database | Run `schema.sql` against the intended local MySQL server and confirm the database is named `smartstock_db`. |
 | App still uses an old password | Stop Flask with Ctrl+C, save `.env`, then start `python app.py` again. `.env` is loaded when the process starts. |
-| Categories are missing | Confirm the API connection works and the seed statements in `schema.sql` ran. Check <http://127.0.0.1:5000/api/categories>. |
+| Categories are missing | Sign in, confirm the API connection works, and check that the seed statements in `schema.sql` ran. Then check <http://127.0.0.1:5000/api/categories>. |
 
 The database health route returns safe hints, not credentials. For a failed application request, inspect the terminal where `python app.py` is running. Never share a screenshot or log containing your real password.
 
 ## Main features
 
+- Username/password sign-in with hashed passwords, signed sessions, CSRF checks, and sign-out. Create accounts locally with `python create_user.py`.
 - Product, category and supplier catalog with paginated product search.
 - Stock adjustment history; each adjustment records a reason.
-- Sales written as invoices and sale items, with stock decrement and movement records in one transaction. Insufficient stock causes the transaction to roll back.
+- Record a product and quantity sold for a chosen date in the dashboard's Sales section. Today's sales reduce available stock; past-date entries backfill invoice and forecasting history without changing today's stock.
+- Sales are written as invoices, sale items and daily product summaries in one transaction. Today's sales also write stock movements; insufficient stock causes the transaction to roll back.
 - Dashboard totals, sales summaries, inventory value, stock alerts and reorder suggestions.
 - CSV ETL that aggregates daily SKU sales and loads product-day summaries.
 - Random Forest demand model compared with a historical-average baseline; chronological evaluation records MAE/RMSE and saves a joblib artifact.
@@ -143,24 +167,30 @@ Finally, in the dashboard click **Generate forecast**. The API stores seven days
 | Method | Route | Purpose |
 |---|---|---|
 | `GET` | `/health/db` | Check MySQL connectivity. |
+| `GET`, `POST` | `/login` | Show sign-in page or start an authenticated session. |
+| `POST` | `/logout` | End the current session. |
 | `GET` | `/api/dashboard?days=30` | Dashboard metrics and chart data. |
 | `GET`, `POST` | `/api/products` | List/search or create products. |
 | `GET`, `PUT`, `DELETE` | `/api/products/<id>` | Read, update or delete a product. |
 | `POST` | `/api/products/<id>/adjust` | Apply a signed stock adjustment with a reason. |
 | `GET`, `POST` | `/api/categories` | List or create categories. |
 | `GET`, `POST` | `/api/suppliers` | List or create suppliers. |
-| `GET`, `POST` | `/api/sales` | List recent sales or record a sale. |
+| `GET`, `POST` | `/api/sales` | List recent sales with line items or record a dated sale. |
 | `GET` | `/api/movements` | List recent stock movement history. |
 | `GET` | `/api/reorder` | Get risk/reorder recommendations. |
 | `GET` | `/api/predictions` | List saved forecast rows. |
 | `POST` | `/api/predictions/generate` | Generate forecast rows from the model artifact. |
 | `GET` | `/api/pipeline/status` | Read the last ETL run. |
 
+The dashboard and all `/api/*` routes require an authenticated session. `/login` is the sign-in page; `/logout` signs out using a CSRF-protected POST. Dashboard API write requests also require the CSRF token issued with the page. `/health/db` remains available without sign-in and returns only connection status and safe hints.
+
 Example sale request body:
 
 ```json
-{"items":[{"product_id":1,"quantity":2},{"product_id":5,"quantity":1}]}
+{"sale_date":"2026-10-27","items":[{"product_id":1,"quantity":2},{"product_id":5,"quantity":1}]}
 ```
+
+`sale_date` is optional and defaults to today. Dates in the past are treated as historical backfill and do not adjust current stock. Future dates are rejected.
 
 ## Tests
 
@@ -168,4 +198,4 @@ The test suite uses a separate database URL. Set `TEST_DATABASE_URL` to a dispos
 
 ## Security and scope
 
-The `users` table is currently a schema placeholder: the app has no login, password verification, or role enforcement. Keep this demonstration bound to localhost. Before exposing it to other users or deploying it, implement authentication and authorization, CSRF protection, secure secret management, backups, migrations, and production WSGI deployment settings. Bootstrap, Chart.js and the browser UI's other CDN assets require internet access in the browser.
+Passwords are stored as Werkzeug password hashes, sign-in uses Flask-Login sessions, and form/API writes use Flask-WTF CSRF protection. The `role` column is reserved; the current application gives all signed-in accounts the same permissions. Account creation is local through `create_user.py`; password recovery and account management screens are not implemented. Keep this demonstration bound to localhost. Before production use, configure a persistent secret, HTTPS and secure cookies, backups, account recovery, role-based authorization, migrations, and a production WSGI server. Bootstrap, Chart.js and the browser UI's other CDN assets require internet access in the browser.

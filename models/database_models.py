@@ -2,6 +2,7 @@
 from datetime import datetime, date
 from decimal import Decimal
 from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
 from sqlalchemy import CheckConstraint, UniqueConstraint, Index
 
 db = SQLAlchemy()
@@ -121,9 +122,12 @@ class ModelMetric(db.Model):
     evaluated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
-class User(db.Model):
+class User(UserMixin, db.Model):
     __tablename__ = "users"
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.Enum("admin", "staff", name="user_role"), nullable=False, default="staff")
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    last_login_at = db.Column(db.DateTime)
